@@ -41,7 +41,7 @@ model {
   // Priors are weakly skeptical of differences
   alpha ~ normal(mean_outcome, sd_outcome);
   gamma ~ cauchy(0, 1);
-  nu ~ exponential(1.0/29);
+  nu ~ cauchy(0, 1); //exponential(1.0/29);
 
   // Likelihood
   for (n in 1:N){
