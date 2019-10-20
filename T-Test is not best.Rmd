@@ -1,0 +1,221 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(rstan)
+library(tidybayes)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+theme_minimal() %+replace%
+  theme(panel.grid.major = element_blank(),
+        plot.background = element_rect(color = "transparent", fill = "grey90")) %>% 
+  theme_set()
+```
+
+
+```{r}
+library(ggplot2movies)
+
+# Clean up data
+set.seed(1234)  # Set seed so we get the same sampled rows every time
+movies_clean <- movies %>% 
+  select(title, year, rating, Action, Comedy) %>% 
+  filter(!(Action == 1 & Comedy == 1)) %>% 
+  mutate(genre = case_when(Action == 1 ~ "Action",
+                           Comedy == 1 ~ "Comedy",
+                           TRUE ~ "Neither")) %>%
+  filter(genre != "Neither") %>%
+  select(-Action, -Comedy)
+
+head(movies_clean)
+```
+
+```{r}
+movies_clean %>% 
+  group_by(genre) %>% 
+  sample_n(200, replace = FALSE) %>% 
+  ungroup() %>% 
+  write.csv(file = '/home/rishi/Documents/repos/T-Test is not BEST/movies.csv')
+```
+
+
+We are interested in analyzing the difference in these two groups. Are they statistically significant or is it just noise?
+```{r fig.height=2.5, fig.width=5}
+ggplot(movies_clean, aes(x = rating, y = fct_rev(genre), fill = genre)) +
+  geom_halfeyeh() +
+  theme(panel.grid.major.x = element_line(color = "white"),
+        legend.position = "none") +
+  scale_x_continuous(breaks = 0:10) +
+  scale_fill_manual(values = viridis::inferno(2, alpha = .6)) +
+  ylab("") + xlab("Rating") + ggtitle("Observed ratings by genre")
+```
+
+
+Now lets go bayesian
+
+$$
+\begin{align}
+rating &\sim student\_t(\nu, \mu_i, \sigma_i) \\
+\mu_i &= \alpha_{group[i]} \\
+\sigma_i &= \gamma_{group[i]} \\
+\nu &\sim exponential(\frac{1}{29}) \\
+\alpha &\sim normal(5.5, 2) \\
+\sigma &\sim cauchy(0, 1) \\
+\end{align}
+$$
+
+```{stan output.var = "stan_best"}
+data {
+  int<lower=1> N;                           // Sample size
+  int<lower=2> n_groups;                    // Number of groups
+  vector[N] rating;                         // Outcome variable
+  int<lower=1, upper=n_groups> group_id[N]; // Group variable
+}
+transformed data {
+  real mean_rating;
+  real sd_rating;
+  mean_rating = mean(rating);
+  sd_rating = sd(rating);
+}
+parameters {
+  vector[n_groups] alpha;              // Group means 
+  vector<lower=0>[n_groups] gamma;     // Group sds
+  real<lower=0, upper=100> nu;         // df for t distribution
+}
+model {
+  real location;
+  real scale;
+  
+  alpha ~ normal(mean_rating, sd_rating);
+  gamma ~ cauchy(0, 1);
+  nu ~ exponential(1.0/29);
+  
+  for (n in 1:N){
+    location = alpha[group_id[n]];
+    scale = gamma[group_id[n]];
+    rating[n] ~ student_t(nu, location, scale);
+  }
+}
+generated quantities {
+  // Mean difference
+  real mu_diff;
+  real sigma_diff;
+  mu_diff = alpha[1] - alpha[2];
+  sigma_diff = gamma[1] - gamma[2];
+}
+```
+
+We set up our index variables such that group_id 1 maps to comedy and group_id 2 maps to action.
+
+```{r}
+dlist <- list(
+  N = nrow(movies_clean),
+  n_groups = length(unique(movies_clean$genre)),
+  rating = movies_clean$rating,
+  group_id = as.integer(fct_rev(movies_clean$genre)))
+
+fit <- sampling(stan_best, data = dlist, 
+                chains = 4, cores = 4, refresh = 0)
+fit
+```
+
+Diagnostics suggest a good fit.
+```{r}
+check_hmc_diagnostics(fit)
+```
+
+
+```{r fig.height=4, fig.width=10, warning=FALSE}
+post <- gather_draws(fit, alpha[group], gamma[group]) %>% 
+  ungroup() %>% 
+  mutate(group = str_c("Group ", group))
+
+plot_posterior_moment <- function(vec, width = .95) {
+  m <- mean(vec)
+  hdi <- as.vector(hdi(vec, .width = width))
+  df <- enframe(vec)
+  
+  ggplot(df, aes(vec)) +
+    stat_density(geom = "line", size = 1, color = viridis(1)) +
+    geom_segment(aes(x = hdi[1], xend = hdi[2], 
+                     y = 0, yend = 0),
+                 color = viridis(1)) +
+    geom_point(aes(y=0, x = m), size = 2, shape = 1, color = viridis(1)) +
+    scale_y_continuous(NULL, NULL) + xlab("Posterior Distribution") +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_line(color = "white"))
+}
+
+p1 <- post %>% 
+  filter(.variable == "alpha", group == "Group 1") %>% 
+  pull(.value) %>% 
+  plot_posterior_moment() +
+    scale_x_continuous(name = NULL, breaks = seq(5, 7, .1), limits = c(5.1, 6.1)) +
+    labs(title = expression(mu[1]))
+p2 <- post %>% 
+  filter(.variable == "alpha", group == "Group 2") %>% 
+  pull(.value) %>% 
+  plot_posterior_moment() +
+    scale_x_continuous(name = NULL, breaks = seq(5, 7, .1), limits = c(5.1, 6.1)) +
+    labs(title = expression(mu[2]))
+p3 <- post %>% 
+  filter(.variable == "gamma", group == "Group 1") %>% 
+  pull(.value) %>% 
+  plot_posterior_moment() +
+  scale_x_continuous(name = NULL, breaks = seq(1, 3, by = .1), limits = c(1.3,1.7)) +
+    labs(title = expression(sigma[1]))
+p4 <- post %>% 
+  filter(.variable == "gamma", group == "Group 2") %>% 
+  pull(.value) %>% 
+  plot_posterior_moment() +
+  scale_x_continuous(name = NULL, breaks = seq(1, 3, by = .1), limits = c(1.3,1.7)) +
+    labs(title = expression(sigma[2]))
+
+p1 + p3 + p2 + p4 +
+  plot_annotation(title = "Posterior Moments",
+                  subtitle = "Shown with 95% credibility about the mean")
+```
+
+
+
+
+```{r fig.height=2, fig.width=10}
+post_mudiff <- spread_draws(fit, mu_diff, sigma_diff)
+p1 <- plot_posterior_moment(post_mudiff$mu_diff) +
+  scale_x_continuous(expression(mu[comedy] - mu[action]), breaks = seq(.6, .9, by = .02), limits = c(.65, .9)) +
+  labs(title = "Posterior difference in means",
+       subtitle = "Shown with 95% credibility about the mean")
+
+p2 <- plot_posterior_moment(post_mudiff$sigma_diff) +
+  scale_x_continuous(expression(sigma[comedy] - sigma[action]), breaks = seq(-.3, 0, .02), limits = c(-.24, -.06)) +
+  labs(title = "Posterior difference in standard deviations",
+       subtitle = "Shown with 95% credibility about the mean")
+
+p1 + p2
+```
+
+```{r fig.height=2, fig.width=5}
+spread_draws(fit, nu) %>% 
+  pull(nu) %>% 
+  plot_posterior_moment() +
+  scale_x_continuous(expression(nu), breaks = seq(10, 60, 5), limits = c(10, 50)) +
+  labs(title = "Posterior degrees of freedom",
+       subtitle = "Shown with 95% credibility about the mean")
+```
+
+
+
+
+
+
+
+
+
+
+
